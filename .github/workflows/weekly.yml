@@ -1,0 +1,23 @@
+name: weekly_mlbio_digest
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 14 * * 3"  # Wednesdays 09:00 America/New_York (14:00 UTC standard time)
+
+jobs:
+  run-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: python -m pip install --upgrade pip requests
+      - name: Run digest
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python mlbio_digest.py
