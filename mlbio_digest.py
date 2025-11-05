@@ -13,9 +13,18 @@ import requests
 
 DAY = 86400
 TOP_VENUES = [
-    "Nature","Nature Medicine","Nature Biotechnology","Nature Methods","Nature Genetics","Nature Chemical Biology",
-    "Nature Machine Intelligence","Nature Communications","Nature Aging","Nature Computational Science",
-    "Cell","Cell Reports","Cell Systems","Immunity","Cancer Cell","Molecular Cell","Cell Genomics","Cell Host & Microbe"
+    # --- Core Nature/Cell family ---
+    "Nature","Nature Medicine","Nature Biotechnology","Nature Methods","Nature Genetics",
+    "Nature Chemical Biology","Nature Machine Intelligence","Nature Communications",
+    "Nature Cancer","Nature Immunology","Nature Reviews Cancer","Nature Reviews Immunology",
+    "Cell","Cell Reports","Cell Reports Medicine","Cell Systems","Cell Genomics",
+    "Immunity","Cancer Cell","Molecular Cell","Cell Host & Microbe",
+    # --- Other high-impact oncology / immunology journals ---
+    "Science","Science Translational Medicine","Science Immunology",
+    "The Lancet Oncology","Cancer Discovery","Cancer Immunology Research",
+    "Clinical Cancer Research","JCO Precision Oncology","Nature Reviews Drug Discovery",
+    "npj Precision Oncology","npj Systems Biology and Applications",
+    "Frontiers in Immunology","Frontiers in Oncology"
 ]
 
 def iso_date(d: dt.date) -> str:
@@ -94,9 +103,18 @@ def first_two_sentences(text: str) -> str:
 def fetch_crossref() -> List[Dict[str,Any]]:
     since, until = last_30_window()
     # Query per journal with simpler keyword filter to avoid Crossref parser quirks
-    KEYWORDS = ["machine learning", "deep learning", "artificial intelligence",
-                "neural network", "foundation model", "graph learning",
-                "genomics", "proteomics", "immunology", "cancer", "protein"]
+    KEYWORDS = [
+        "machine learning", "deep learning", "artificial intelligence", "foundation model",
+        "neural network", "graph learning", "transformer", "representation learning",
+        "immunology", "t cell", "t-cell", "tcr", "neoantigen", "immune checkpoint",
+        "tumor microenvironment", "immunotherapy", "checkpoint blockade",
+        "cancer", "oncology", "tumor", "antigen", "peptide presentation", "hla",
+        "mhc", "tumor-infiltrating lymphocyte", "b cell receptor", "antibody repertoire",
+        "spatial omics", "proteomics", "immunopeptidomics", "cytometry", "cell phenotype"
+    ]
+    EXCLUDE_KEYWORDS = [
+        "embryology", "embryonic development", "morphogenesis", "developmental biology"
+    ]
     JOURNALS = [
         "Nature","Nature Medicine","Nature Biotechnology","Nature Methods","Nature Genetics",
         "Nature Chemical Biology","Nature Machine Intelligence","Nature Communications",
@@ -126,6 +144,8 @@ def fetch_crossref() -> List[Dict[str,Any]]:
             # quick in-memory keyword match
             hay = " ".join([title, re.sub(r"<[^>]+>", " ", abstr or "")]).lower()
             if not any(k in hay for k in [kw.lower() for kw in KEYWORDS]):
+                continue
+            if any(x in hay for x in EXCLUDE_KEYWORDS):
                 continue
 
             issued = x.get("issued",{}).get("date-parts", [[]])[0]
@@ -220,7 +240,15 @@ def parse_arxiv_xml(xml: str) -> List[Dict[str,Any]]:
 
 def fetch_arxiv_top2() -> List[Dict[str,Any]]:
     since, until = last_30_window()
-    query = '((ti:"biology" OR ti:"biomedical" OR ti:"genomics" OR ti:"proteomics" OR ti:"protein" OR ti:"immunology" OR ti:"cancer" OR abs:"biology" OR abs:"genomics" OR abs:"proteomics")) AND (cat:cs.LG OR cat:stat.ML OR cat:q-bio.BM OR cat:q-bio.QM OR ti:"machine learning" OR ti:"deep learning")'
+    query = (
+        '((ti:"cancer" OR ti:"oncology" OR ti:"tumor" OR ti:"immunotherapy" OR '
+        'ti:"t-cell" OR ti:"tcr" OR ti:"neoantigen" OR ti:"immune checkpoint" OR '
+        'abs:"cancer" OR abs:"tumor" OR abs:"immunotherapy" OR abs:"neoantigen" OR '
+        'abs:"t-cell" OR abs:"tcr" OR abs:"immune checkpoint") '
+        'AND (ti:"machine learning" OR ti:"deep learning" OR ti:"artificial intelligence" OR '
+        'abs:"machine learning" OR abs:"deep learning" OR abs:"artificial intelligence")) '
+        'AND NOT (abs:"embryology" OR abs:"developmental biology" OR ti:"embryology")'
+    )   
     url = f"https://export.arxiv.org/api/query?search_query={requests.utils.quote(query)}&sortBy=submittedDate&sortOrder=descending&max_results=60"
     xml = fetch_text(url)
     items = parse_arxiv_xml(xml)
