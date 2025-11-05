@@ -93,38 +93,68 @@ def first_two_sentences(text: str) -> str:
 
 def fetch_crossref() -> List[Dict[str,Any]]:
     since, until = last_30_window()
-    q = '("machine learning" OR "deep learning" OR "artificial intelligence" OR "neural network") (biology OR biomedical OR genomics OR proteomics OR immunology OR cancer)'
-    url = (
-        "https://api.crossref.org/works"
-        f"?filter=from-pub-date:{since},until-pub-date:{until},type:journal-article"
-        f"&query.bibliographic={requests.utils.quote(q)}"
-        "&select=DOI,title,container-title,author,abstract,URL,created,issued"
-        "&rows=120"
-    )
-    j = fetch_json(url, headers={"Accept":"application/json","User-Agent":"mlbio-digest/1.0 (mailto:you@example.com)"})
-    items = []
-    for x in j.get("message", {}).get("items", []):
-        journal = ((x.get("container-title") or [])[:1] or [""])[0]
-        if journal not in TOP_VENUES:
-            continue
-        title = ((x.get("title") or [])[:1] or [""])[0]
-        issued = x.get("issued",{}).get("date-parts", [[]])[0]
-        pubdate = "-".join(str(p) for p in issued) if issued else (x.get("created",{}).get("date-time","")[:10])
-        authors = [(" ".join(filter(None, [a.get("given"), a.get("family")]))).strip() for a in (x.get("author") or [])]
-        abstract = (x.get("abstract") or "").replace("\n"," ")
-        abstract = re.sub(r"<[^>]+>", " ", abstract).strip()
-        items.append({
-            "source": "Crossref",
-            "journal": journal,
-            "title": title,
-            "abstract": abstract,
-            "authors": authors,
-            "published": pubdate,
-            "url": x.get("URL"),
-            "doi": x.get("DOI")
-        })
+    # Query per journal with simpler keyword filter to avoid Crossref parser quirks
+    KEYWORDS = ["machine learning", "deep learning", "artificial intelligence",
+                "neural network", "foundation model", "graph learning",
+                "genomics", "proteomics", "immunology", "cancer", "protein"]
+    JOURNALS = [
+        "Nature","Nature Medicine","Nature Biotechnology","Nature Methods","Nature Genetics",
+        "Nature Chemical Biology","Nature Machine Intelligence","Nature Communications",
+        "Cell","Cell Reports","Cell Systems","Immunity","Cancer Cell","Molecular Cell",
+        "Cell Genomics","Cell Host & Microbe"
+    ]
 
-    # Parallel Altmetric lookups (cap to ~25 to stay snappy)
+    results = []
+    headers = {"Accept":"application/json","User-Agent":"mlbio-digest/1.0 (mailto:you@example.com)"}
+
+    for jname in JOURNALS:
+        # Start with broad date filter; keep rows modest to reduce latency
+        base = ( "https://api.crossref.org/works"
+                 f"?filter=from-pub-date:{since},until-pub-date:{until},type:journal-article,container-title:{requests.utils.quote(jname, safe='')}"
+                 "&select=DOI,title,container-title,author,abstract,URL,created,issued"
+                 "&rows=20" )
+        # Pull once without keywords (fast), then keyword-filter locally
+        try:
+            j = fetch_json(base, headers=headers)
+        except Exception as e:
+            print(f"[Crossref] Skipped {jname}: {e}")
+            continue
+
+        for x in j.get("message", {}).get("items", []):
+            title = ((x.get("title") or [])[:1] or [""])[0]
+            abstr = (x.get("abstract") or "")
+            # quick in-memory keyword match
+            hay = " ".join([title, re.sub(r"<[^>]+>", " ", abstr or "")]).lower()
+            if not any(k in hay for k in [kw.lower() for kw in KEYWORDS]):
+                continue
+
+            issued = x.get("issued",{}).get("date-parts", [[]])[0]
+            pubdate = "-".join(str(p) for p in issued) if issued else (x.get("created",{}).get("date-time","")[:10])
+            authors = [(" ".join(filter(None, [a.get("given"), a.get("family")]))).strip() for a in (x.get("author") or [])]
+            clean_abs = re.sub(r"<[^>]+>", " ", abstr).strip()
+
+            rec = {
+                "source": "Crossref",
+                "journal": ((x.get("container-title") or [])[:1] or [""])[0],
+                "title": title,
+                "abstract": clean_abs,
+                "authors": authors,
+                "published": pubdate,
+                "url": x.get("URL"),
+                "doi": x.get("DOI")
+            }
+            results.append(rec)
+
+    # De-dupe by DOI
+    seen = set()
+    uniq = []
+    for it in results:
+        if it.get("doi") and it["doi"] in seen:
+            continue
+        if it.get("doi"): seen.add(it["doi"])
+        uniq.append(it)
+
+    # Altmetric enrichment with small parallel fan-out
     from concurrent.futures import ThreadPoolExecutor, as_completed
     def enrich(it):
         if it.get("doi"):
@@ -132,15 +162,17 @@ def fetch_crossref() -> List[Dict[str,Any]]:
         it["rank_score"] = score_item(it)
         return it
 
-    out = []
-    recent_candidates = items[:25]  # first 25 most recent
+    enriched = []
     with ThreadPoolExecutor(max_workers=5) as ex:
-        futs = [ex.submit(enrich, it) for it in recent_candidates]
+        futs = [ex.submit(enrich, it) for it in uniq[:30]]  # cap to 30
         for f in as_completed(futs):
-            out.append(f.result())
+            enriched.append(f.result())
 
-    out.sort(key=lambda r: (r.get("altmetric_score") or 0.0), reverse=True)
-    return out[:5]
+    # Sort by Altmetric score desc, keep top 5
+    enriched.sort(key=lambda r: (r.get("altmetric_score") or 0.0), reverse=True)
+    top5 = enriched[:5]
+    print(f"Crossref candidates: {len(uniq)}, after Altmetric keep: {len(top5)}")
+    return top5
 
 def parse_arxiv_xml(xml: str) -> List[Dict[str,Any]]:
     # minimal parse: not robust XML library to avoid extra deps
@@ -254,10 +286,11 @@ def slack_blocks(items: List[Dict[str,str]]) -> Dict[str,Any]:
         })
     return {"blocks": [header, divider, *sections]}
 
-def post_to_slack(webhook_url: str, payload: Dict[str,Any]):
-    resp = requests.post(webhook_url, json=payload, timeout=20)
-    if resp.status_code >= 300:
-        raise RuntimeError(f"Slack webhook failed: HTTP {resp.status_code} {resp.text[:2000]}")
+def post_to_slack(webhook_url, payload):
+    import requests
+    r = requests.post(webhook_url, json=payload, timeout=20)
+    print(f"Slack status={r.status_code} body={r.text[:200]}")
+    r.raise_for_status()
 
 def main():
     webhook = os.environ.get("SLACK_WEBHOOK_URL")
