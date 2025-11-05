@@ -8,6 +8,7 @@ on:
 jobs:
   run-digest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,4 +21,4 @@ jobs:
       - name: Run digest
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: python mlbio_digest.py
+        run: python -u mlbio_digest.py

@@ -99,9 +99,9 @@ def fetch_crossref() -> List[Dict[str,Any]]:
         f"?filter=from-pub-date:{since},until-pub-date:{until},type:journal-article"
         f"&query.bibliographic={requests.utils.quote(q)}"
         "&select=DOI,title,container-title,author,abstract,URL,created,issued"
-        "&rows=200"
+        "&rows=120"
     )
-    j = fetch_json(url)
+    j = fetch_json(url, headers={"Accept":"application/json","User-Agent":"mlbio-digest/1.0 (mailto:you@example.com)"})
     items = []
     for x in j.get("message", {}).get("items", []):
         journal = ((x.get("container-title") or [])[:1] or [""])[0]
@@ -113,7 +113,7 @@ def fetch_crossref() -> List[Dict[str,Any]]:
         authors = [(" ".join(filter(None, [a.get("given"), a.get("family")]))).strip() for a in (x.get("author") or [])]
         abstract = (x.get("abstract") or "").replace("\n"," ")
         abstract = re.sub(r"<[^>]+>", " ", abstract).strip()
-        rec = {
+        items.append({
             "source": "Crossref",
             "journal": journal,
             "title": title,
@@ -122,15 +122,25 @@ def fetch_crossref() -> List[Dict[str,Any]]:
             "published": pubdate,
             "url": x.get("URL"),
             "doi": x.get("DOI")
-        }
-        if rec["doi"]:
-            rec.update(altmetric_by_doi(rec["doi"]))
-        rec["rank_score"] = score_item(rec)
-        items.append(rec)
-    # sort by altmetric score primarily
-    items.sort(key=lambda r: (r.get("altmetric_score") or 0.0), reverse=True)
-    # keep top 5
-    return items[:5]
+        })
+
+    # Parallel Altmetric lookups (cap to ~25 to stay snappy)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    def enrich(it):
+        if it.get("doi"):
+            it.update(altmetric_by_doi(it["doi"]))
+        it["rank_score"] = score_item(it)
+        return it
+
+    out = []
+    recent_candidates = items[:25]  # first 25 most recent
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = [ex.submit(enrich, it) for it in recent_candidates]
+        for f in as_completed(futs):
+            out.append(f.result())
+
+    out.sort(key=lambda r: (r.get("altmetric_score") or 0.0), reverse=True)
+    return out[:5]
 
 def parse_arxiv_xml(xml: str) -> List[Dict[str,Any]]:
     # minimal parse: not robust XML library to avoid extra deps
@@ -179,20 +189,32 @@ def parse_arxiv_xml(xml: str) -> List[Dict[str,Any]]:
 def fetch_arxiv_top2() -> List[Dict[str,Any]]:
     since, until = last_30_window()
     query = '((ti:"biology" OR ti:"biomedical" OR ti:"genomics" OR ti:"proteomics" OR ti:"protein" OR ti:"immunology" OR ti:"cancer" OR abs:"biology" OR abs:"genomics" OR abs:"proteomics")) AND (cat:cs.LG OR cat:stat.ML OR cat:q-bio.BM OR cat:q-bio.QM OR ti:"machine learning" OR ti:"deep learning")'
-    url = f"https://export.arxiv.org/api/query?search_query={requests.utils.quote(query)}&sortBy=submittedDate&sortOrder=descending&max_results=100"
+    url = f"https://export.arxiv.org/api/query?search_query={requests.utils.quote(query)}&sortBy=submittedDate&sortOrder=descending&max_results=60"
     xml = fetch_text(url)
     items = parse_arxiv_xml(xml)
-    # filter last 30 days
+
     cutoff = dt.datetime.utcnow().date() - dt.timedelta(days=30)
     items = [it for it in items if it.get("published") and dt.date.fromisoformat(it["published"]) >= cutoff]
-    # enrich with Altmetric if available
-    for it in items:
+
+    # Only the 10 most recent get Altmetric calls
+    recent = sorted(items, key=lambda r: r.get("published",""), reverse=True)[:10]
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    def enrich(it):
         if it.get("arxiv_id"):
             it.update(altmetric_by_arxiv(it["arxiv_id"]))
         it["rank_score"] = score_item(it)
-    # rank by altmetric score primarily then recency
-    items.sort(key=lambda r: ((r.get("altmetric_score") or 0.0), r.get("published","")), reverse=True)
-    return items[:2]
+        return it
+
+    enriched = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futs = [ex.submit(enrich, it) for it in recent]
+        for f in as_completed(futs):
+            enriched.append(f.result())
+
+    enriched.sort(key=lambda r: ((r.get("altmetric_score") or 0.0), r.get("published","")), reverse=True)
+    return enriched[:2]
+
 
 def format_item(it: Dict[str,Any]) -> Dict[str,str]:
     # produce fields: title, date, url, summary (2 sentences)
@@ -204,8 +226,14 @@ def format_item(it: Dict[str,Any]) -> Dict[str,str]:
     return {"title": title, "date": date, "url": url, "summary": summary}
 
 def build_digest() -> List[Dict[str,str]]:
-    cross = fetch_crossref()  # top 5 by Altmetric score; Nature/Cell family only
-    arx = fetch_arxiv_top2()  # top 2 arXiv (Altmetric if available)
+    print("Fetching Crossref (Nature/Cell)…")
+    cross = fetch_crossref()
+    print(f"Crossref done: {len(cross)} items")
+
+    print("Fetching arXiv…")
+    arx = fetch_arxiv_top2()
+    print(f"arXiv done: {len(arx)} items")
+
     items = [format_item(x) for x in cross] + [format_item(x) for x in arx]
     return items
 
@@ -236,10 +264,14 @@ def main():
     if not webhook:
         print("ERROR: SLACK_WEBHOOK_URL environment variable is not set.", file=sys.stderr)
         sys.exit(2)
+
+    print("Starting digest…")
     items = build_digest()
+    print(f"Built payload with {len(items)} items")
     payload = slack_blocks(items)
+    print("Posting to Slack…")
     post_to_slack(webhook, payload)
-    print(f"Posted {len(items)} items to Slack.")
+    print("Posted to Slack OK.")
 
 if __name__ == "__main__":
     main()
